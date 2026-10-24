@@ -351,6 +351,17 @@ GEX_CMAP = LinearSegmentedColormap.from_list("gex_dark", ["#b833e0", "#0d0d0d", 
 BRAND_PURPLE = "#B833E0"
 BRAND_GREEN = "#22C55E"
 
+# TradingView resolves plain symbols differently from Yahoo in some cases.
+# These aliases force index underlyings to render the intended Cboe index chart
+# in the auxiliary widget.
+TRADINGVIEW_SYMBOL_ALIASES = {
+    "SPX": "CBOE:SPX",
+    "XSP": "CBOE:XSP",
+    "NDX": "NASDAQ:NDX",
+    "RUT": "CBOE:RUT",
+    "DJX": "CBOE:DJX",
+}
+
 
 def style_gex_matrix(matrix: pd.DataFrame, atm_strike: float | None = None):
     """Zero-centered color scale on a BLACK background (custom diverging palette
@@ -410,10 +421,11 @@ def render_tradingview_widget(ticker: str, height: int = 300) -> str:
     on options analytics). The ticker is passed as-is, with no exchange-prefix
     mapping (NASDAQ:/AMEX:/...) — TradingView resolves the symbol itself; if
     some ticker resolves to the wrong thing, we'll deal with it then."""
+    resolved_symbol = TRADINGVIEW_SYMBOL_ALIASES.get(ticker.upper(), ticker)
     config_json = json.dumps({
         "width": "100%",
         "height": height,
-        "symbol": ticker,
+        "symbol": resolved_symbol,
         "interval": "D",
         "timezone": "Etc/UTC",
         "theme": "dark",
@@ -438,6 +450,27 @@ def render_tradingview_widget(ticker: str, height: int = 300) -> str:
       </script>
     </div>
     """
+
+
+def underlying_price_history(
+    conn, ticker: str, *, source: str | None = None, days: int | None = config.SNAPSHOT_HISTORY_DAYS
+) -> pd.DataFrame:
+    """Underlying price over collected moments for one ticker.
+
+    This is a fallback for symbols that the embedded TradingView widget cannot
+    render in-place. It reads only stored snapshots — no external requests.
+    """
+    moments = db.get_collection_moments(conn, ticker, days=days, source=source)
+    if not moments:
+        return pd.DataFrame(columns=["collected_at", "underlying_price"])
+    frame = db.get_snapshots_at(conn, ticker, moments, source=source)
+    if frame.empty:
+        return pd.DataFrame(columns=["collected_at", "underlying_price"])
+    return (
+        frame[["collected_at", "underlying_price"]]
+        .drop_duplicates(subset=["collected_at"], keep="last")
+        .sort_values("collected_at")
+    )
 
 
 conn = db.get_connection()
@@ -550,7 +583,21 @@ with st.sidebar:
             "try ASML, SAP, SHEL, NVO, BUD."
         ),
     )
-    new_ticker = (_label_to_symbol.get(_choice) or (_choice or "")).strip().upper()
+    typed_symbol = ""
+    if not _catalogue_symbols:
+        typed_symbol = st.text_input(
+            "Or type symbol manually",
+            value="",
+            placeholder="AAPL",
+            key="add_ticker_manual",
+            help="Use this while the symbol directory is still loading.",
+        )
+
+    new_ticker = (
+        typed_symbol
+        if typed_symbol.strip()
+        else (_label_to_symbol.get(_choice) or (_choice or ""))
+    ).strip().upper()
 
     # Said once, and only while it is true. An empty directory is not a failure
     # anybody has to act on — the box still accepts anything typed into it — but
@@ -559,7 +606,7 @@ with st.sidebar:
     if not _catalogue_symbols:
         st.caption(
             "The symbol directory has not been downloaded yet, so this box cannot "
-            "search by company name — type the symbol itself. It arrives on the "
+            "search by company name — type the symbol itself in the manual field below. It arrives on the "
             "collector's next pass."
         )
 
@@ -1157,7 +1204,23 @@ if active_view == "Overview":
     # underlying. The hosted product keeps it at the foot of Overview for the
     # same reason, and this is where somebody actually looks for it.
     st.subheader("Underlying price")
-    components.html(render_tradingview_widget(selected_ticker, height=450), height=450)
+    if selected_ticker.upper() in TRADINGVIEW_SYMBOL_ALIASES:
+        price_history = underlying_price_history(
+            conn, selected_ticker, source=page_source, days=history_days
+        )
+        if price_history.empty:
+            st.info("No stored underlying-price history yet. Collect more snapshots to populate this chart.")
+        else:
+            st.line_chart(
+                with_viewer_index(price_history.set_index("collected_at"))["underlying_price"],
+                color=BRAND_GREEN,
+            )
+        st.caption(
+            "TradingView does not always provide embedded access for this index symbol, "
+            "so this chart shows the underlying prices from your collected snapshots."
+        )
+    else:
+        components.html(render_tradingview_widget(selected_ticker, height=450), height=450)
 
 
 if active_view == "Changes":
@@ -1354,6 +1417,109 @@ if active_view == "Max Pain / GEX":
     st.subheader("Max Pain")
     mp = metrics.max_pain(latest_df, selected_expiry)
     st.metric("Max Pain strike", mp if mp is not None else "n/a")
+
+    expiry_slice = latest_df[latest_df["expiry"] == selected_expiry].copy()
+    st.caption(
+        "Strike-by-strike option market value for the selected expiry (OI-weighted)."
+    )
+
+    if expiry_slice.empty:
+        st.info("No contracts available for this expiry.")
+    else:
+        expiry_slice["open_interest"] = pd.to_numeric(expiry_slice["open_interest"], errors="coerce").fillna(0.0)
+        expiry_slice["strike"] = pd.to_numeric(expiry_slice["strike"], errors="coerce")
+        expiry_slice = expiry_slice.dropna(subset=["strike"])
+
+        def payout_curve(frame: pd.DataFrame, weight_col: str) -> pd.DataFrame:
+            strikes = np.sort(frame["strike"].unique())
+            if strikes.size == 0:
+                return pd.DataFrame(columns=["strike", "Call", "Put"])
+
+            call_weights = (
+                frame[frame["option_type"] == "call"]
+                .groupby("strike")[weight_col]
+                .sum()
+                .reindex(strikes, fill_value=0.0)
+                .to_numpy(dtype=float)
+            )
+            put_weights = (
+                frame[frame["option_type"] == "put"]
+                .groupby("strike")[weight_col]
+                .sum()
+                .reindex(strikes, fill_value=0.0)
+                .to_numpy(dtype=float)
+            )
+
+            payout_matrix = np.maximum(strikes[:, None] - strikes[None, :], 0.0)
+            call_payout = (payout_matrix @ call_weights) * 100.0
+            put_payout = (payout_matrix.T @ put_weights) * 100.0
+
+            return pd.DataFrame({
+                "strike": strikes,
+                "Call": call_payout,
+                "Put": put_payout,
+            })
+
+        oi_curve = payout_curve(expiry_slice, "open_interest")
+
+        latest_spot = float(pd.to_numeric(expiry_slice["underlying_price"], errors="coerce").dropna().iloc[-1])
+        max_pain_strike = float(mp) if mp is not None else None
+        strike_window = 200.0
+        window_min = latest_spot - strike_window
+        window_max = latest_spot + strike_window
+
+        def build_curve_chart(curve: pd.DataFrame, value_label: str) -> alt.Chart:
+            curve = curve[(curve["strike"] >= window_min) & (curve["strike"] <= window_max)].copy()
+            if curve.empty:
+                return alt.Chart(pd.DataFrame({"strike": [], "side": [], "value": []})).mark_bar()
+            long = curve.melt(id_vars=["strike"], value_vars=["Call", "Put"], var_name="side", value_name="value")
+            bars = (
+                alt.Chart(long)
+                .mark_bar(size=9)
+                .encode(
+                    x=alt.X("strike:Q", title="Strike", axis=alt.Axis(format=",.0f", labelAngle=-90)),
+                    xOffset=alt.XOffset("side:N"),
+                    y=alt.Y("value:Q", title=value_label),
+                    color=alt.Color(
+                        "side:N",
+                        scale=alt.Scale(domain=["Call", "Put"], range=[BRAND_GREEN, "#d62728"]),
+                        legend=alt.Legend(title=None, orient="top"),
+                    ),
+                    tooltip=[
+                        alt.Tooltip("strike:Q", title="Strike", format=",.0f"),
+                        alt.Tooltip("side:N", title="Side"),
+                        alt.Tooltip("value:Q", title="Value", format=",.2f"),
+                    ],
+                )
+                .properties(height=260)
+            )
+            return bars
+
+        current_price_rule = (
+            alt.Chart(pd.DataFrame({"strike": [latest_spot]}))
+            .mark_rule(color="#ef4444", strokeDash=[6, 4], size=2)
+            .encode(x="strike:Q")
+        )
+        max_pain_rule = (
+            alt.Chart(pd.DataFrame({"strike": [max_pain_strike]}))
+            .mark_rule(color="#1d9bf0", strokeDash=[6, 4], size=2)
+            .encode(x="strike:Q")
+            if max_pain_strike is not None
+            else None
+        )
+
+        oi_chart = build_curve_chart(oi_curve, "Option payout value (OI-weighted)")
+        oi_chart = (oi_chart + current_price_rule + max_pain_rule) if max_pain_rule is not None else (oi_chart + current_price_rule)
+
+        st.markdown("**Option Market Value by Strike (OI)**")
+        st.altair_chart(oi_chart, use_container_width=True)
+        st.caption(
+            f"Showing strikes in [{window_min:,.0f}, {window_max:,.0f}] around spot. "
+            f"Reference lines — Last price: {latest_spot:,.2f} (red), Max Pain: "
+            + (f"{max_pain_strike:,.0f}" if max_pain_strike is not None else "n/a")
+            + " (blue)."
+        )
+
     with howto("Max Pain / GEX"):
         st.write(
             "The strike at which total payouts by option sellers are minimal. The price at "
@@ -1363,8 +1529,18 @@ if active_view == "Max Pain / GEX":
             "tendency that fundamental news can override."
         )
 
-    st.subheader("Approximate Gamma Exposure (GEX)")
+    st.subheader("Approximate Gamma / GEX by Strike")
     gex = metrics.gamma_exposure_profile(latest_df, selected_expiry)
+    gamma_profile = metrics.gamma_profile_by_strike(latest_df, selected_expiry, as_of=latest_date)
+    gex_snapshot = latest_df[
+        (latest_df["collected_at"] == latest_date)
+        & (latest_df["expiry"] == selected_expiry)
+    ].copy()
+    spot_values = pd.to_numeric(gex_snapshot["underlying_price"], errors="coerce").dropna()
+    gex_spot = float(spot_values.iloc[-1]) if not spot_values.empty else None
+    gex_window = 200.0
+    gex_window_min = (gex_spot - gex_window) if gex_spot is not None else None
+    gex_window_max = (gex_spot + gex_window) if gex_spot is not None else None
     if years_left <= 0:
         # Say why, instead of drawing a flat line at zero. Gamma is undefined
         # once there is no time left, so this is a property of the contract,
@@ -1381,30 +1557,118 @@ if active_view == "Max Pain / GEX":
             st.success(f"Net GEX: {net_gex:,.0f} — positive gamma: dealers dampen price moves")
         else:
             st.warning(f"Net GEX: {net_gex:,.0f} — negative gamma: dealers amplify price moves")
-        # Colored by sign (green/purple), matching the same diverging language
-        # as the GEX Heatmap — st.bar_chart can't condition color on a row's
-        # own value, so this one chart uses Altair directly instead of the
-        # thin st.bar_chart wrapper.
-        gex_chart_data = gex.assign(sign=np.where(gex["gex"] >= 0, "Positive", "Negative"))
-        st.altair_chart(
-            alt.Chart(gex_chart_data)
-            .mark_bar()
-            .encode(
-                x=alt.X("strike:O", title="Strike"),
-                y=alt.Y("gex:Q", title="GEX"),
-                color=alt.Color(
-                    "sign:N",
-                    scale=alt.Scale(domain=["Positive", "Negative"], range=[BRAND_GREEN, BRAND_PURPLE]),
-                    legend=None,
-                ),
-            ),
-            use_container_width=True,
-        )
+        gex_chart_data = gex.copy()
+        gex_chart_data["strike"] = pd.to_numeric(gex_chart_data["strike"], errors="coerce")
+        gex_chart_data["gex"] = pd.to_numeric(gex_chart_data["gex"], errors="coerce")
+        gex_chart_data = gex_chart_data.dropna(subset=["strike", "gex"])
+
+        gamma_chart_data = gamma_profile.copy()
+        gamma_chart_data["strike"] = pd.to_numeric(gamma_chart_data["strike"], errors="coerce")
+        gamma_chart_data["gamma"] = pd.to_numeric(gamma_chart_data["gamma"], errors="coerce")
+        gamma_chart_data = gamma_chart_data.dropna(subset=["strike", "gamma"])
+
+        if gex_window_min is not None and gex_window_max is not None:
+            gex_chart_data = gex_chart_data[
+                (gex_chart_data["strike"] >= gex_window_min)
+                & (gex_chart_data["strike"] <= gex_window_max)
+            ].copy()
+            gamma_chart_data = gamma_chart_data[
+                (gamma_chart_data["strike"] >= gex_window_min)
+                & (gamma_chart_data["strike"] <= gex_window_max)
+            ].copy()
+
+        if gex_chart_data.empty and gamma_chart_data.empty:
+            st.info("No strikes in the current price ±200 range for this expiry.")
+        else:
+            gex_chart_data["sign"] = np.where(gex_chart_data["gex"] >= 0, "Positive", "Negative")
+
+            x_encoding = alt.X(
+                "strike:Q",
+                title="Strike",
+                axis=alt.Axis(format=",.0f", labelAngle=-90),
+                scale=alt.Scale(
+                    domain=[gex_window_min, gex_window_max]
+                ) if gex_window_min is not None and gex_window_max is not None else alt.Undefined,
+            )
+            color_encoding = alt.Color(
+                "sign:N",
+                scale=alt.Scale(domain=["Positive", "Negative"], range=[BRAND_GREEN, BRAND_PURPLE]),
+                legend=None,
+            )
+            spot_rule = (
+                alt.Chart(pd.DataFrame({"strike": [gex_spot]}))
+                .mark_rule(color="#ef4444", strokeDash=[6, 4], size=2)
+                .encode(x="strike:Q")
+                if gex_spot is not None
+                else None
+            )
+
+            gex_chart = (
+                alt.Chart(gex_chart_data)
+                .mark_bar(size=9)
+                .encode(
+                    x=x_encoding,
+                    y=alt.Y("gex:Q", title="GEX"),
+                    color=color_encoding,
+                    tooltip=[
+                        alt.Tooltip("strike:Q", title="Strike", format=",.0f"),
+                        alt.Tooltip("gex:Q", title="GEX", format=",.2f"),
+                    ],
+                )
+                .properties(height=220)
+            )
+            gamma_abs_max = float(gamma_chart_data["gamma"].abs().max()) if not gamma_chart_data.empty else 0.0
+            gamma_chart_data["sign"] = np.where(gamma_chart_data["gamma"] >= 0, "Positive", "Negative")
+            gamma_chart_data["gamma_norm"] = (
+                gamma_chart_data["gamma"] / gamma_abs_max
+                if gamma_abs_max > 0
+                else 0.0
+            )
+            gamma_chart = (
+                alt.Chart(gamma_chart_data)
+                .mark_bar(size=9)
+                .encode(
+                    x=x_encoding,
+                    y=alt.Y(
+                        "gamma_norm:Q",
+                        title="Gamma Exposure (normalized)",
+                        scale=alt.Scale(domain=[-1, 1]),
+                    ),
+                    color=alt.Color(
+                        "sign:N",
+                        scale=alt.Scale(domain=["Positive", "Negative"], range=[BRAND_GREEN, BRAND_PURPLE]),
+                        legend=alt.Legend(title=None, orient="top"),
+                    ),
+                    tooltip=[
+                        alt.Tooltip("strike:Q", title="Strike", format=",.0f"),
+                        alt.Tooltip("sign:N", title="Sign"),
+                        alt.Tooltip("gamma_norm:Q", title="Normalized", format=".3f"),
+                        alt.Tooltip("gamma:Q", title="Gamma Exposure", format=",.2f"),
+                    ],
+                )
+                .properties(height=220)
+            )
+
+            if spot_rule is not None:
+                gex_chart = gex_chart + spot_rule
+                gamma_chart = gamma_chart + spot_rule
+
+            st.markdown("**GEX by Strike**")
+            st.altair_chart(gex_chart, use_container_width=True)
+            st.markdown("**Gamma Exposure by Strike (Net)**")
+            st.altair_chart(gamma_chart, use_container_width=True)
+
+            if gex_window_min is not None and gex_window_max is not None and gex_spot is not None:
+                st.caption(
+                    f"Showing strikes in [{gex_window_min:,.0f}, {gex_window_max:,.0f}] around spot "
+                    f"{gex_spot:,.2f}. Red line marks current price."
+                )
     else:
         st.info("No data to compute GEX for the selected expiry.")
     st.caption(
-        "Estimated via the Black-Scholes formula and a sign heuristic (puts contribute "
-        "negatively). Does not reflect actual market-maker positioning — an approximation only."
+        "Gamma Exposure chart shows net signed exposure by strike (gamma × OI × 100 × spot), "
+        "colored by positive/negative sign and normalized to [-1, 1] by max absolute strike value. "
+        "Tooltips show raw exposure values."
     )
     with st.expander("ℹ️ How to read this"):
         st.write(

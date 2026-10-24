@@ -79,6 +79,88 @@ from app.metrics_core import (
     years_to_expiry_series,
 )
 
+
+def max_pain_series_volume(df: pd.DataFrame) -> pd.DataFrame:
+    """Max pain over time using traded volume as the weight instead of OI.
+
+    This is an alternate view for comparison only; the canonical max pain in
+    the app remains OI-based (`max_pain_series`).
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["collected_at", "expiry", "max_pain"])
+    weighted = df.copy()
+    weighted["open_interest"] = pd.to_numeric(weighted.get("volume"), errors="coerce").fillna(0.0)
+    return max_pain_series(weighted)
+
+
+def gamma_profile_by_strike_side(
+    df: pd.DataFrame,
+    expiry: pd.Timestamp,
+    pricing: PricingInputs = DEFAULT_PRICING,
+    as_of: pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    """Signed gamma exposure by strike and side (Call/Put).
+
+    Exposure is computed as model gamma × open interest × 100 × spot.
+    Calls contribute positively and puts negatively.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["strike", "side", "gamma"])
+
+    snapshot_date = as_of if as_of is not None else df["collected_at"].max()
+    snapshot = df[(df["collected_at"] == snapshot_date) & (df["expiry"] == expiry)].copy()
+    if snapshot.empty:
+        return pd.DataFrame(columns=["strike", "side", "gamma"])
+
+    spot_values = pd.to_numeric(snapshot["underlying_price"], errors="coerce").dropna()
+    if spot_values.empty:
+        return pd.DataFrame(columns=["strike", "side", "gamma"])
+    spot = float(spot_values.iloc[0])
+
+    years = years_to_expiry(expiry, snapshot_date)
+    if years is None or years <= 0:
+        return pd.DataFrame(columns=["strike", "side", "gamma"])
+
+    snapshot["strike"] = pd.to_numeric(snapshot["strike"], errors="coerce")
+    snapshot["implied_volatility"] = pd.to_numeric(snapshot["implied_volatility"], errors="coerce")
+    snapshot = snapshot.dropna(subset=["strike", "implied_volatility", "option_type"])
+    if snapshot.empty:
+        return pd.DataFrame(columns=["strike", "side", "gamma"])
+
+    snapshot["gamma"] = snapshot.apply(
+        lambda row: _black_scholes_greeks(
+            spot,
+            float(row["strike"]),
+            years,
+            float(row["implied_volatility"]),
+            pricing.rate_for(years),
+            str(row["option_type"]),
+            dividend_yield=pricing.dividend_yield,
+        )["gamma"],
+        axis=1,
+    )
+    snapshot["side"] = np.where(snapshot["option_type"] == "call", "Call", "Put")
+    snapshot.loc[snapshot["side"] == "Put", "gamma"] *= -1.0
+
+    profile = snapshot.groupby(["strike", "side"], as_index=False)["gamma"].sum()
+    return profile.sort_values(["strike", "side"]).reset_index(drop=True)
+
+
+    snapshot["open_interest"] = pd.to_numeric(snapshot.get("open_interest"), errors="coerce").fillna(0.0)
+    snapshot["gamma"] = snapshot["gamma"] * snapshot["open_interest"] * 100.0 * spot
+def gamma_profile_by_strike(
+    df: pd.DataFrame,
+    expiry: pd.Timestamp,
+    pricing: PricingInputs = DEFAULT_PRICING,
+    as_of: pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    """Signed gamma exposure profile by strike (calls positive, puts negative)."""
+    side_profile = gamma_profile_by_strike_side(df, expiry, pricing=pricing, as_of=as_of)
+    if side_profile.empty:
+        return pd.DataFrame(columns=["strike", "gamma"])
+    profile = side_profile.groupby("strike", as_index=False)["gamma"].sum()
+    return profile.sort_values("strike").reset_index(drop=True)
+
 # --- gamma weather -----------------------------------------------------------
 # The five states a daily summary can be in. Names, not icons: which picture a
 # state gets is a decision for the screen, and whatever stores these has no
@@ -371,6 +453,8 @@ __all__ = [
     "dealer_walls",
     "expiry_rollup",
     "gamma_exposure_profile",
+    "gamma_profile_by_strike",
+    "gamma_profile_by_strike_side",
     "gamma_flip_from_matrix",
     "gamma_flip_price",
     "gex_matrix",
